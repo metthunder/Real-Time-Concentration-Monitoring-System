@@ -555,4 +555,4 @@ if __name__ == '__main__':
     data_store.initialize_serial()
     
     # Run the app
-    app.run_server(debug=False, port=8051)
+    app.run_server(debug=False, port=8052)

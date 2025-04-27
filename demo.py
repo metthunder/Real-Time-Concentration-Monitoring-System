@@ -1,13 +1,37 @@
 import dash
-from dash import dcc, html, Input, Output, State
+from dash import dcc, html, Input, Output, State, dash_table
 import plotly.graph_objs as go
 import time
 import serial
 import numpy as np
 import atexit
+import torch
+import torch.nn as nn
+import pickle
+import pandas as pd
 
-# Initialize the Dash app
-app = dash.Dash(__name__)
+# LSTM Model Definition
+class LSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, output_dim, forecast_horizon, device):
+        super(LSTM, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.forecast_horizon = forecast_horizon
+        self.device = device
+
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        
+        self.fc = nn.Linear(hidden_dim, forecast_horizon * output_dim)
+        self.output_dim = output_dim
+
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim, device=self.device).requires_grad_()
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim, device=self.device).requires_grad_()
+        out, (hn, cn) = self.lstm(x, (h0.detach(), c0.detach()))
+        out = out[:, -1, :]  
+        out = self.fc(out)  
+        out = out.view(-1, self.forecast_horizon, self.output_dim)
+        return out
 
 # Global variables for data storage
 class DataStore:
@@ -19,22 +43,71 @@ class DataStore:
         self.exposure_start_time = None
         self.total_exposure_time = 0  # in seconds
         self.arduino_connected = False
-        self.currently_exposed = False  # New flag to track current exposure state
+        self.currently_exposed = False
+        
+        # LSTM Model Initialization
+        self.input_dim = 1
+        self.hidden_dim = 32
+        self.num_layers = 2
+        self.output_dim = 1
+        self.forecast_horizon = 10
+        self.device = 'cpu'
+        
+        # Load Scaler and Model
+        try:
+            with open('scaler.pkl', 'rb') as f:
+                self.scaler = pickle.load(f)
+            
+            self.model = LSTM(
+                self.input_dim, 
+                self.hidden_dim, 
+                self.num_layers, 
+                self.output_dim, 
+                self.forecast_horizon, 
+                self.device
+            ).to(self.device)
+            
+            self.model.load_state_dict(torch.load('lstm.pth', weights_only=True))
+            self.model.eval()
+            print("LSTM Model and Scaler loaded successfully")
+        except Exception as e:
+            print(f"Error loading LSTM model: {e}")
+            self.model = None
+            self.scaler = None
+
+    def predict_next_datapoints(self, input_seq):
+        if self.model is None or self.scaler is None:
+            return None
+        
+        try:
+            # Prepare input data
+            input_data = self.scaler.transform(input_seq.reshape(-1, 1))
+            x = torch.tensor(input_data, dtype=torch.float32).reshape(1, -1, 1)
+            
+            # Predict
+            y_pred = self.model(x).detach().numpy()
+            y_pred = y_pred.reshape(-1, 1)
+            final_y_pred = self.scaler.inverse_transform(y_pred)
+            
+            return final_y_pred.reshape(-1)
+        except Exception as e:
+            print(f"Prediction error: {e}")
+            return None
 
     def initialize_serial(self):
-        """Initialize serial connection"""
-        if self.ser is None or not self.ser.is_open:
-            try:
-                self.ser = serial.Serial("COM7", 9600, timeout=1)
-                time.sleep(2)  # Allow Arduino to initialize
-                self.arduino_connected = True
-                print("Successfully connected to Arduino on COM7")
-                return True
-            except serial.SerialException as e:
-                print(f"Error connecting to Arduino: {e}")
-                self.arduino_connected = False
-                return False
-        return True
+        try:
+            # Try multiple potential COM ports
+            port = 'COM7'
+            self.ser = serial.Serial(port, 9600, timeout=1)
+            time.sleep(2)  # Allow Arduino to initialize
+            self.arduino_connected = True
+            print(f"Successfully connected to Arduino on {port}")
+            return True
+        
+        except Exception as e:
+            print(f"Unexpected error in serial connection: {e}")
+            self.arduino_connected = False
+            return False
 
     def read_data(self):
         """Read data from Arduino"""
@@ -63,13 +136,46 @@ class DataStore:
             self.ser.close()
             print("Serial connection closed.")
 
+class ThresholdCrossingTracker:
+    def __init__(self):
+        self.crossings = []
+    
+    def log_crossing(self, timestamp, concentration, threshold):
+        crossing = {
+            'start_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp)),
+            'start_timestamp': timestamp,  # Store raw timestamp
+            'concentration': round(concentration, 2),
+            'threshold': threshold,
+            'duration': 0,
+            'end_time': None
+        }
+        self.crossings.append(crossing)
+    
+    def update_crossing(self, timestamp):
+        if self.crossings and self.crossings[-1]['end_time'] is None:
+            # Calculate duration using stored raw timestamps
+            duration = round(timestamp - self.crossings[-1]['start_timestamp'], 2)
+            
+            self.crossings[-1]['duration'] = duration
+            self.crossings[-1]['end_time'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
+    
+    def get_crossings_dataframe(self):
+        # Remove raw timestamp before converting to DataFrame
+        display_crossings = [{k: v for k, v in crossing.items() if k != 'start_timestamp'} 
+                             for crossing in self.crossings]
+        return pd.DataFrame(display_crossings)
+
 # Create global data store
 data_store = DataStore()
+threshold_tracker = ThresholdCrossingTracker()
 
 # Register cleanup function
 atexit.register(data_store.cleanup)
 
-# Define styles
+# Initialize Dash app
+app = dash.Dash(__name__)
+
+# Styles (Keep existing styles)
 CARD_STYLE = {
     'backgroundColor': 'white',
     'borderRadius': '10px',
@@ -77,7 +183,7 @@ CARD_STYLE = {
     'padding': '20px',
     'margin': '10px',
     'flex': '1',
-    'minWidth': '300px',  # Increased from 200px
+    'minWidth': '300px',
     'textAlign': 'center'
 }
 
@@ -93,7 +199,7 @@ LABEL_STYLE = {
     'textTransform': 'uppercase'
 }
 
-# App layout
+# Enhanced App Layout
 app.layout = html.Div([
     # Header
     html.Div([
@@ -173,6 +279,61 @@ app.layout = html.Div([
         'margin': '20px 0'
     }),
 
+    # Threshold Crossing Log Section
+    html.Div([
+        html.H2("Threshold Crossing Log", style={'textAlign': 'center', 'color': '#4CAF50'}),
+        html.Div([
+            # Interactive Threshold Crossing Table
+            dash_table.DataTable(
+                id='threshold-crossings-table',
+                columns=[
+                    {'name': 'Start Time', 'id': 'start_time'},
+                    {'name': 'Concentration', 'id': 'concentration'},
+                    {'name': 'Threshold', 'id': 'threshold'},
+                    {'name': 'Duration (s)', 'id': 'duration'},
+                    {'name': 'End Time', 'id': 'end_time'}
+                ],
+                style_table={'overflowX': 'auto'},
+                style_cell={'textAlign': 'left'},
+                style_header={
+                    'backgroundColor': '#4CAF50',
+                    'color': 'white',
+                    'fontWeight': 'bold'
+                }
+            )
+        ]),
+        
+        # Export and Clear Buttons
+        html.Div([
+            html.Button(
+                'Export Log', 
+                id='export-log-button', 
+                style={
+                    'backgroundColor': '#2196F3',
+                    'color': 'white',
+                    'margin': '10px',
+                    'padding': '10px 20px',
+                    'borderRadius': '5px'
+                }
+            ),
+            html.Button(
+                'Clear Log', 
+                id='clear-log-button', 
+                style={
+                    'backgroundColor': '#f44336',
+                    'color': 'white',
+                    'margin': '10px',
+                    'padding': '10px 20px',
+                    'borderRadius': '5px'
+                }
+            )
+        ], style={'textAlign': 'center'})
+    ], style={'margin': '20px 0'}),
+
+    # Download component for log export
+    dcc.Download(id="download-log"),
+
+    # Interval component
     dcc.Interval(
         id='interval-component',
         interval=1000,  # Update every second
@@ -180,7 +341,57 @@ app.layout = html.Div([
     )
 ], style={'padding': '20px', 'backgroundColor': '#f5f5f5', 'minHeight': '100vh'})
 
-# Add callback for threshold update
+# Threshold Crossing Tracking Callback
+@app.callback(
+    [Output('threshold-crossings-table', 'data'),
+     Output('download-log', 'data')],
+    [Input('interval-component', 'n_intervals'),
+     Input('export-log-button', 'n_clicks'),
+     Input('clear-log-button', 'n_clicks')],
+    [State('threshold-input', 'value')]
+)
+def manage_threshold_crossings(n, export_clicks, clear_clicks, threshold):
+    ctx = dash.callback_context
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    current_time = time.time()
+    current_concentration = data_store.read_data() or data_store.y_data[-1]
+
+    print(f"Current Concentration: {current_concentration}, Threshold: {threshold}")
+
+    # Threshold Crossing Logic
+    if current_concentration > threshold:
+        if not data_store.currently_exposed:
+            # Log the start of threshold crossing
+            print("Logging threshold crossing start")
+            threshold_tracker.log_crossing(current_time, current_concentration, threshold)
+            data_store.currently_exposed = True
+    elif data_store.currently_exposed:
+        # Log the end of threshold crossing
+        print("Logging threshold crossing end")
+        threshold_tracker.update_crossing(current_time)
+        data_store.currently_exposed = False
+
+    # Export Log
+    if triggered_id == 'export-log-button':
+        crossings_df = threshold_tracker.get_crossings_dataframe()
+        print(f"Exporting log: {crossings_df}")
+        return (
+            crossings_df.to_dict('records'),
+            dict(content=crossings_df.to_csv(index=False), filename='threshold_crossings.csv')
+        )
+    
+    # Clear Log
+    elif triggered_id == 'clear-log-button':
+        threshold_tracker.crossings = []
+        return [], None
+
+    # Regular update
+    crossings_df = threshold_tracker.get_crossings_dataframe()
+    print(f"Crossings DataFrame: {crossings_df}")
+    return crossings_df.to_dict('records'), None
+
+# Existing Callback for Threshold Update
 @app.callback(
     Output('threshold-input', 'value'),
     [Input('threshold-button', 'n_clicks')],
@@ -191,6 +402,7 @@ def update_threshold(n_clicks, new_threshold):
         data_store.threshold = new_threshold
     return new_threshold
 
+# Existing Callback for Graph and Stats Update
 @app.callback(
     [Output('live-update-graph', 'figure'),
      Output('stats-div', 'children'),
@@ -242,6 +454,12 @@ def update_graph(n):
         data_store.x_data.pop(0)
         data_store.y_data.pop(0)
 
+    # Prediction for next datapoints
+    prediction = None
+    if len(data_store.y_data) >= 15:  # Ensure we have enough historical data
+        input_seq = np.array(data_store.y_data[-15:])
+        prediction = data_store.predict_next_datapoints(input_seq)
+
     # Calculate statistics
     max_concentration = max(data_store.y_data)
     min_concentration = min(data_store.y_data)
@@ -256,7 +474,7 @@ def update_graph(n):
                 x=[time.strftime('%H:%M:%S', time.localtime(ts)) for ts in data_store.x_data],
                 y=data_store.y_data,
                 mode='lines+markers',
-                name='Ammonia Concentration',
+                name='Actual Concentration',
                 line=dict(color='#4CAF50', width=2),
                 marker=dict(size=6)
             ),
@@ -282,7 +500,23 @@ def update_graph(n):
         )
     }
 
+    # Add prediction trace if available
+    if prediction is not None:
+        # Generate x-axis for prediction
+        last_time = data_store.x_data[-1]
+        pred_times = [last_time + i for i in range(1, len(prediction) + 1)]
+        
+        prediction_trace = go.Scatter(
+            x=[time.strftime('%H:%M:%S', time.localtime(ts)) for ts in pred_times],
+            y=prediction,
+            mode='lines',
+            name='Predicted Concentration',
+            line=dict(color='#2196F3', width=2, dash='dot')
+        )
+        figure['data'].append(prediction_trace)
+
     # Create statistics cards
+
     stats = [
         html.Div([
             html.Div("Maximum", style=LABEL_STYLE),
