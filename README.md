@@ -29,7 +29,7 @@ cd Ammonia-Monitoring-System
 ### 2. Installing Dependencies
 
 ```bash
-pip install -r requiremnets.txt
+pip install -r requirements.txt
 ```
 
 ### 3. Running the Dashboard
