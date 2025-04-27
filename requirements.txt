@@ -1,0 +1,10 @@
+dash
+plotly
+pandas
+numpy
+matplotlib
+torch
+scikit-learn
+tensorflow
+joblib
+pyserial
