@@ -22,8 +22,8 @@ The predictions help in taking early action in case of dangerous gas levels.
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/Ammonia-Monitoring-System.git
-cd Ammonia-Monitoring-System
+git clone https://github.com/metthunder/Real-Time-Concentration-Monitoring-System
+cd Real-Time-Concentration-Monitoring-System
 ```
 
 ### 2. Installing Dependencies
